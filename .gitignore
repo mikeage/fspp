@@ -9,4 +9,4 @@ bin-release/
 .project
 
 # Compiled output
-.swf
+*.swf
