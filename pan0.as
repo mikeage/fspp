@@ -90,6 +90,8 @@ package  {
     import org.papervision3d.materials.BitmapFileMaterial;
     import org.papervision3d.view.BasicView;
     import gs.TweenLite;
+    import com.formatlos.as3.lib.display.BitmapDataUnlimited;
+    import com.formatlos.as3.lib.display.events.BitmapDataUnlimitedEvent;
 
     
     public class pan0 extends BasicView {
@@ -101,13 +103,26 @@ package  {
             
         private var tesselation: Number = 30;
     
+        // Applying the bitmap to the sphere as a material doesn't always line up correctly. This will correct for the mismatch.
+        private var alignmentCorrection: Number = 0;
+
         private var PA: Number = 0;                    
         private var minPA: Number = -90;                    
         private var maxPA: Number = 90;                     
 
+        // Wraparound is handled automatically
+        private var minPan: Number = -360;
+        private var maxPan: Number = 360;
+
         private var FOV: Number = 70;                    
         private var minFOV: Number = 40;                    
         private var maxFOV: Number = 120;       
+        // Horizontal FOV. This is calculated automatically as a function of the aspect ratio and vertical FOV specific by the user
+        private var HFOV: Number = FOV;
+
+        // Field of View of the panorama. 360x180 for a full spherical panorama
+        private var panHFOV: Number = 0;
+        private var panVFOV: Number = 0;
             
         private var allowFullScreen: Boolean = true;
         private var mirrorImage: Boolean = false;
@@ -132,6 +147,11 @@ package  {
         
         private var panoSphere: Sphere;
         private var material: BitmapFileMaterial;
+
+        // For partial panorams, we need to map it onto a larger bitmap of ratio 2:1.
+        private var paddedBitmap: BitmapDataUnlimited;
+        // Offset of the partial image onto the 2:1 full surface
+        private var dstPoint:Point = new Point();
 
         private var needsFastFrameRender: Boolean = false;
         private var needsSmoothFrameRender: Boolean = true;
@@ -179,6 +199,12 @@ package  {
             if (loaderInfo.parameters.maxFOV)
                 maxFOV= loaderInfo.parameters.maxFOV;
             
+            if (loaderInfo.parameters.panHFOV)
+                panHFOV= loaderInfo.parameters.panHFOV;
+
+            if (loaderInfo.parameters.panVFOV)
+                panVFOV= loaderInfo.parameters.panVFOV;
+
             if (loaderInfo.parameters.allowFullScreen)
                 allowFullScreen= loaderInfo.parameters.allowFullScreen;
             
@@ -191,6 +217,7 @@ package  {
             txtLoadProgressFormat.size= 20;
             txtLoadProgress.textColor= 0xFFFFFF;
             txtLoadProgress.selectable= false;
+            txtLoadProgress.multiline= true;
             txtLoadProgress.defaultTextFormat= txtLoadProgressFormat;
             txtLoadProgress.autoSize= TextFieldAutoSize.CENTER;
             addChild(txtLoadProgress);
@@ -249,13 +276,21 @@ package  {
                 " <b>[Esc]</b> - exit fullscreen mode (always works)<br><br>" +
                 "<font size='11'><p align='center'>click anywhere in this box to close</p></font>";
             
+            try {
             material = new BitmapFileMaterial(panoSrc);
+            } catch(e:Error) {
+              txtHelpMessage.htmlText += "Error creating BitmapFileMaterial: " + e;
+            }
             material.doubleSided = true;
             material.interactive = true;
             material.addEventListener(FileLoadEvent.LOAD_PROGRESS, onLoadProgress);
             material.addEventListener(FileLoadEvent.LOAD_COMPLETE, onLoadComplete);
             
+            try {
             panoSphere= new Sphere(material, 30000, tesselation, tesselation);
+            } catch(e:Error) {
+              txtHelpMessage.htmlText += "Error creating sphere" + e;
+            }
             
             if (!mirrorImage)
                 panoSphere.scaleZ= -1;
@@ -270,6 +305,10 @@ package  {
             camera.x = camera.y = camera.z = 0;
             camera.focus = 300;
             
+            // Partial panoramas are displayed at an offset of -90 (with a little more of an error due to the tesselation). For full panorams, this is less important (although you may otherwise notice that the start view is not in the center of the flat picture
+            alignmentCorrection = -90 - (360/tesselation);
+            camera.rotationY = alignmentCorrection;
+
             onStageResize();
         }
 
@@ -299,8 +338,8 @@ package  {
             
             try {
                 getChildIndex(txtLoadProgress);
-                txtLoadProgress.x= stage.stageWidth / 2;
-                txtLoadProgress.y= stage.stageHeight / 2;
+                txtLoadProgress.x= (stage.stageWidth - txtLoadProgress.textWidth) / 2;
+                txtLoadProgress.y= (stage.stageHeight - txtLoadProgress.textHeight) / 2;
             }
             catch (e: ArgumentError) {
             }
@@ -318,6 +357,9 @@ package  {
             }
             catch (e: ArgumentError) {
             }
+
+            // Recalculate the horizontal FOV, since it depends on the aspect ratio of the stage
+            HFOV = FOV * (stage.stageWidth / stage.stageHeight);
         }
         
         private function onMouseDownEvent(e: MouseEvent): void {
@@ -367,16 +409,119 @@ package  {
             if (FOV > maxFOV)
               FOV = maxFOV;
               
+            // Recalculate the new limits
+            HFOV = FOV * (stage.stageWidth / stage.stageHeight);
+
+            if (panVFOV < 180) {
+              minPA=-(panVFOV-FOV)/2;
+              maxPA=(panVFOV-FOV)/2;
+            }
+
+            if (panHFOV < 360) {
+              minPan=-(panHFOV-HFOV)/2+alignmentCorrection;
+              maxPan=(panHFOV-HFOV)/2+alignmentCorrection;
+            }
+
+            // Call calcCameraRotation to check for wraparound
+            calcCameraRotation();
+
             needsSmoothFrameRender = true;
             e.preventDefault();
         }
         
         private function onLoadProgress(event: FileLoadEvent): void {
             // txtLoadProgress.text = (event.bytesLoaded >> 10) + " KB of " + (event.bytesTotal >> 10) + " KB loaded";
-            txtLoadProgress.text = (event.bytesLoaded >> 10) + " KB loaded";
+            txtLoadProgress.text = "Downloading " + (event.bytesLoaded >> 10) + " KB of " + (event.bytesTotal >> 10) + " KB";
         }
     
         private function onLoadComplete(event: FileLoadEvent): void {
+          // We have the texture, now check if it needs to be padded
+          var aspectRatio:Number;
+          var newHeight:Number;
+          var newWidth:Number;
+
+          aspectRatio = material.bitmap.width / material.bitmap.height;
+
+          // If we have an aspect ratio that's close to 2 (quite close...), assume this is a full panorama
+          if (Math.abs((aspectRatio) - 2) < 0.001) {
+            removeChild(txtLoadProgress);
+            needsSmoothFrameRender = true;
+            return;
+          }
+
+          if ((material.bitmap.width * material.bitmap.height) > 16*1024*1024) {
+            txtLoadProgress.text = "Error: This image is too big!\nFlash 10 images are limited to 16Mpixels, but this image is\n" + material.bitmap.width + "x" + material.bitmap.height;
+            onStageResize();
+            return;
+          }
+
+          txtLoadProgress.text = "Rendering...";
+
+          // If the user didn't provide either a HFOV or VFOV for the panorama (not the camera), we'll assume that anything wider than 2:1 is horizontally complete; less than that is vertically complete.
+          if (panHFOV == 0 && panVFOV == 0) {
+            if (aspectRatio > 2) {
+              panHFOV=360;
+            } else {
+              panVFOV=180;
+            }
+          }
+
+          // Calculate the dimensions of the padded surface
+          if (panHFOV != 0) {
+            newWidth = material.bitmap.width / panHFOV * 360;
+            newHeight = newWidth / 2;
+            panVFOV = panHFOV/aspectRatio;
+          } else {
+            newHeight = material.bitmap.height / panVFOV * 180;
+            newWidth = newHeight * 2;
+            panHFOV = panVFOV*aspectRatio;
+          }
+
+          // The offset to insert the partial image
+          dstPoint.x=(newWidth-material.bitmap.width)/2;
+          dstPoint.y=(newHeight-material.bitmap.height)/2;
+
+          // For a partial panorama, we override *PA and *Pan.
+          if (panVFOV < 180) {
+            minPA=-(panVFOV-FOV)/2;
+            maxPA=(panVFOV-FOV)/2;
+          }
+          if (panHFOV < 360) {
+            minPan=-(panHFOV-HFOV)/2+alignmentCorrection;
+            maxPan=(panHFOV-HFOV)/2+alignmentCorrection;
+          }
+
+/*
+          if ((newWidth * newHeight) > 16*1024*1024) {
+            var correction:Number = (16*1024*1024)/(newWidth * newHeight);
+            txtLoadProgress.text = "Error: This image is too big!\nFlash 10 images are limited to 16Mpixels. This image is\n" + material.bitmap.width + "x" + material.bitmap.height + " itself, and requires a canvas of\n" + Math.round(newWidth) + "x" + Math.round(newHeight) + " to display the partial panorama correctly\nTo display it, resize the panorama to less than\n" + Math.round(material.bitmap.width*correction) + "x" + Math.round(material.bitmap.height*correction);
+						material.bitmap.dispose();
+            onStageResize();
+            return;
+          }
+*/
+          paddedBitmap = new BitmapDataUnlimited();
+          paddedBitmap.addEventListener(BitmapDataUnlimitedEvent.COMPLETE, onPaddedBitmapReady);
+
+          try {
+            paddedBitmap.create(newWidth, newHeight);
+          } catch(e:Error) {
+            txtHelpMessage.htmlText += "Error (pb.c)!" + e;
+          }
+        }
+
+        private function onPaddedBitmapReady(event : BitmapDataUnlimitedEvent) : void {
+          try {
+          // Finally copy the original data onto the new bitmapdata
+          paddedBitmap.bitmapData.copyPixels(material.bitmap, material.bitmap.rect, dstPoint);
+          // We don't need the first bitmap anymore. Will this save any memory??
+          material.bitmap.dispose();
+          // Assign it. The sphere will be automatically updated
+          material.bitmap = paddedBitmap.bitmapData;
+          } catch(e:Error) {
+            txtHelpMessage.htmlText += "Error (pbr)!" + e;
+          }
+
             removeChild(txtLoadProgress);
             needsSmoothFrameRender = true;
         }
@@ -407,12 +552,16 @@ package  {
                     FOV -= 5;
                     if (FOV < minFOV)
                       FOV = minFOV;
+
+                    // Recalculate the HFOV
+                    calcCameraRotation();
                     needsSmoothFrameRender = true; 
                     break;
                 case Keyboard.PAGE_DOWN: 
                     FOV += 5;
                     if (FOV > maxFOV)
                       FOV = maxFOV;
+                    calcCameraRotation();
                     needsSmoothFrameRender = true; 
                     break;
                 case Keyboard.HOME:
@@ -420,6 +569,11 @@ package  {
                        stage.displayState = StageDisplayState.FULL_SCREEN;
                        needsSmoothFrameRender = true; 
                     }
+                    break;
+                case Keyboard.DELETE:
+                    camera.rotationY = alignmentCorrection;
+                    camera.rotationX = 0;
+                    needsSmoothFrameRender = true;
                     break;
                 case Keyboard.F1:
                     displayHelpMessage();
@@ -474,11 +628,30 @@ package  {
             camera.rotationY += (rotationYTarget - camera.rotationY) / 3;
             camera.rotationX += (rotationXTarget - camera.rotationX) / 3;
             
+            // Handle wraparound smoothly; although the camera has no problem with an angle like -54000 degrees, we can't enforce minPan and maxPan without limiting the range to [X,X+360]
+            if (camera.rotationY > 180 + alignmentCorrection) {
+                rotationYStart -= 360;
+                camera.rotationY -= 360;
+                rotationYTarget -= 360;
+            }
+
+            if (camera.rotationY < -180 + alignmentCorrection) {
+                rotationYStart += 360;
+                rotationYTarget += 360;
+                camera.rotationY += 360;
+            }
+
             if (camera.rotationX < minPA)
                 camera.rotationX = minPA;
             
             if (camera.rotationX > maxPA)
                 camera.rotationX = maxPA;
+
+            if (camera.rotationY < minPan)
+                camera.rotationY = minPan;
+
+            if (camera.rotationY > maxPan)
+                camera.rotationY = maxPan;
         }
     }
 }
